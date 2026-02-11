@@ -1,4 +1,5 @@
-# IoT/OT Security Auditor Suite
+# IoT/OT Security Auditor Suite (Work in Progress)
+
 
 A comprehensive PowerShell-based security assessment toolkit for IoT and OT devices. Choose the version that matches your organization's needs - from essential security controls to enterprise-grade compliance with Microsoft Defender integration.
 
