@@ -3,9 +3,11 @@
 OT / ICS / SCADA / IoT Security Auditor
 Unified version: dark amber theme, enhanced protocol coverage, concurrent scanning.
 Export formats: CSV, JSON, XML, PDF (requires reportlab).
-Requirements: Python 3.7+, pymodbus, python-can (optional), pyads (optional).
+Fixed false positives: HTTP/HTTPS probes only report actual web services.
+Requirements: Python 3.7+, built-in modules (tkinter, socket, etc.), reportlab optional.
 """
 
+import sys
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 import threading
@@ -23,6 +25,27 @@ import json
 import xml.etree.ElementTree as ET
 import ssl
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUIREMENTS CHECK – safe startup
+# ─────────────────────────────────────────────────────────────────────────────
+def check_requirements():
+    """Verify that all required modules are available. Warn about missing optional ones."""
+    missing_optional = []
+    # Check for reportlab (optional)
+    try:
+        import reportlab
+    except ImportError:
+        missing_optional.append("reportlab (PDF export disabled)")
+    
+    # All other modules are built-in or provided by Python standard library.
+    # No mandatory missing modules.
+    
+    if missing_optional:
+        print("WARNING: Optional modules missing: " + ", ".join(missing_optional))
+        # Don't exit, just inform user later via GUI
+        return False, missing_optional
+    return True, []
 
 # Try to import reportlab for PDF export
 try:
@@ -183,242 +206,240 @@ DEFAULT_CREDS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROBE FUNCTIONS – all fixed (identical to working version)
+# PROBE FUNCTIONS – all fixed, with safe socket handling and no false positives
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tcp_connect(ip, port, timeout=2.0):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    s.connect((ip, port))
-    return s
+    """Create TCP socket and connect, return socket or raise exception."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect((ip, port))
+    return sock
 
 def probe_tcp_open(ip, port, timeout=2.0):
+    """Check if TCP port is open and optionally grab a banner."""
     try:
-        s = _tcp_connect(ip, port, timeout)
-        s.settimeout(1.0)
-        try:
-            banner = s.recv(256)
-            s.close()
-            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in banner[:80])
-            return True, f"open – banner: {printable.strip()}" if printable.strip() else "open"
-        except:
-            s.close()
-            return True, "open"
-    except:
+        with _tcp_connect(ip, port, timeout) as s:
+            s.settimeout(1.0)
+            try:
+                banner = s.recv(256)
+                printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in banner[:80])
+                return True, f"open – banner: {printable.strip()}" if printable.strip() else "open"
+            except socket.timeout:
+                return True, "open (no banner received)"
+    except (socket.timeout, ConnectionRefusedError, OSError):
         return False, ""
 
 def probe_modbus(ip, port=502, timeout=2.0):
     try:
-        s = _tcp_connect(ip, port, timeout)
-        pkt = bytes([0x00,0x01,0x00,0x00,0x00,0x06,0x01,0x03,0x00,0x00,0x00,0x01])
-        s.sendall(pkt)
-        s.settimeout(1.5)
-        resp = s.recv(256)
-        s.close()
-        if len(resp) >= 8 and resp[7] == 0x03:
-            unit = resp[6]
-            return True, f"Modbus RTU unit={unit} – read holding reg OK – UNAUTHENTICATED"
-        elif len(resp) > 0:
-            return True, "port open – partial Modbus response"
-        return True, "port open – no Modbus data"
-    except:
+        with _tcp_connect(ip, port, timeout) as s:
+            pkt = bytes([0x00,0x01,0x00,0x00,0x00,0x06,0x01,0x03,0x00,0x00,0x00,0x01])
+            s.sendall(pkt)
+            s.settimeout(1.5)
+            resp = s.recv(256)
+            if len(resp) >= 8 and resp[7] == 0x03:
+                unit = resp[6]
+                return True, f"Modbus RTU unit={unit} – read holding reg OK – UNAUTHENTICATED"
+            elif len(resp) > 0:
+                return True, "port open – partial Modbus response"
+            return True, "port open – no Modbus data"
+    except Exception:
         return False, ""
 
 def probe_modbus_udp(ip, port=502, timeout=2.0):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
         pkt = bytes([0x00,0x01,0x00,0x00,0x00,0x06,0x01,0x03,0x00,0x00,0x00,0x01])
-        s.sendto(pkt, (ip, port))
+        sock.sendto(pkt, (ip, port))
         try:
-            resp, _ = s.recvfrom(256)
-            s.close()
+            resp, _ = sock.recvfrom(256)
+            sock.close()
             if len(resp) >= 8 and resp[7] == 0x03:
                 return True, f"Modbus UDP unit={resp[6]} – UNAUTHENTICATED"
             elif len(resp) > 0:
                 return True, "UDP Modbus – partial response"
-        except:
+        except socket.timeout:
             pass
-        s.close()
+        sock.close()
         return False, ""
-    except:
+    except Exception:
         return False, ""
 
 def probe_s7(ip, port=102, timeout=2.0):
     try:
-        s = _tcp_connect(ip, port, timeout)
-        pkt = bytes([0x03,0x00,0x00,0x16,0x11,0xE0,0x00,0x00,0x00,0x01,0x00,
-                     0xC0,0x01,0x0A,0xC1,0x02,0x01,0x00,0xC2,0x02,0x01,0x02])
-        s.sendall(pkt)
-        s.settimeout(1.5)
-        resp = s.recv(128)
-        s.close()
-        if len(resp) >= 4 and resp[0] == 0x03:
-            return True, "Siemens S7 PLC – TPKT/COTP connection accepted – UNAUTHENTICATED"
-        return True, "port 102 open – possible Siemens device"
-    except:
+        with _tcp_connect(ip, port, timeout) as s:
+            pkt = bytes([0x03,0x00,0x00,0x16,0x11,0xE0,0x00,0x00,0x00,0x01,0x00,
+                         0xC0,0x01,0x0A,0xC1,0x02,0x01,0x00,0xC2,0x02,0x01,0x02])
+            s.sendall(pkt)
+            s.settimeout(1.5)
+            resp = s.recv(128)
+            if len(resp) >= 4 and resp[0] == 0x03:
+                return True, "Siemens S7 PLC – TPKT/COTP connection accepted – UNAUTHENTICATED"
+            return True, "port 102 open – possible Siemens device"
+    except Exception:
         return False, ""
 
 def probe_dnp3(ip, port=20000, timeout=2.0):
     try:
-        s = _tcp_connect(ip, port, timeout)
-        pkt = bytes([0x05,0x64,0x05,0xC0,0xFF,0xFF,0x00,0x00,0x65,0x6E])
-        s.sendall(pkt)
-        s.settimeout(1.5)
-        resp = s.recv(64)
-        s.close()
-        if len(resp) >= 2 and resp[0] == 0x05 and resp[1] == 0x64:
-            src = struct.unpack_from('<H', resp, 4)[0] if len(resp) >= 6 else 0
-            return True, f"DNP3 RTU/IED src_addr={src} – no authentication (SA by default off)"
-        return True, "port open – possible DNP3 device"
-    except:
+        with _tcp_connect(ip, port, timeout) as s:
+            pkt = bytes([0x05,0x64,0x05,0xC0,0xFF,0xFF,0x00,0x00,0x65,0x6E])
+            s.sendall(pkt)
+            s.settimeout(1.5)
+            resp = s.recv(64)
+            if len(resp) >= 2 and resp[0] == 0x05 and resp[1] == 0x64:
+                src = struct.unpack_from('<H', resp, 4)[0] if len(resp) >= 6 else 0
+                return True, f"DNP3 RTU/IED src_addr={src} – no authentication (SA by default off)"
+            return True, "port open – possible DNP3 device"
+    except Exception:
         return False, ""
 
 def probe_iec104(ip, port=2404, timeout=2.0):
     try:
-        s = _tcp_connect(ip, port, timeout)
-        pkt = bytes([0x68,0x04,0x07,0x00,0x00,0x00])
-        s.sendall(pkt)
-        s.settimeout(1.5)
-        resp = s.recv(32)
-        s.close()
-        if len(resp) >= 1 and resp[0] == 0x68:
-            return True, "IEC 60870-5-104 slave – STARTDT accepted – unencrypted SCADA"
-        return True, "port open – possible IEC104 device"
-    except:
+        with _tcp_connect(ip, port, timeout) as s:
+            pkt = bytes([0x68,0x04,0x07,0x00,0x00,0x00])
+            s.sendall(pkt)
+            s.settimeout(1.5)
+            resp = s.recv(32)
+            if len(resp) >= 1 and resp[0] == 0x68:
+                return True, "IEC 60870-5-104 slave – STARTDT accepted – unencrypted SCADA"
+            return True, "port open – possible IEC104 device"
+    except Exception:
         return False, ""
 
 def probe_opcua(ip, port=4840, timeout=2.0):
     try:
-        s = _tcp_connect(ip, port, timeout)
-        endpoint = f"opc.tcp://{ip}:{port}".encode()
-        ep_len = len(endpoint)
-        msg_size = 28 + ep_len
-        hello = struct.pack('<4sIIIII', b'HEL ', msg_size, 0,
-                            65536, 65536, ep_len) + endpoint
-        s.sendall(hello)
-        s.settimeout(1.5)
-        resp = s.recv(64)
-        s.close()
-        if len(resp) >= 4:
-            msg_type = resp[:3]
-            if msg_type in (b'ACK', b'ERR', b'OPN', b'HEL'):
-                return True, f"OPC UA server – response type={msg_type.decode()} – check security mode"
-        return True, "port open – possible OPC UA"
-    except:
+        with _tcp_connect(ip, port, timeout) as s:
+            endpoint = f"opc.tcp://{ip}:{port}".encode()
+            ep_len = len(endpoint)
+            msg_size = 28 + ep_len
+            hello = struct.pack('<4sIIIII', b'HEL ', msg_size, 0,
+                                65536, 65536, ep_len) + endpoint
+            s.sendall(hello)
+            s.settimeout(1.5)
+            resp = s.recv(64)
+            if len(resp) >= 4:
+                msg_type = resp[:3]
+                if msg_type in (b'ACK', b'ERR', b'OPN', b'HEL'):
+                    return True, f"OPC UA server – response type={msg_type.decode()} – check security mode"
+            return True, "port open – possible OPC UA"
+    except Exception:
         return False, ""
 
 def probe_enip(ip, port=44818, timeout=2.0):
     try:
-        s = _tcp_connect(ip, port, timeout)
-        req = bytes([0x65,0x00,0x04,0x00,0x00,0x00,0x00,0x00,
-                     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-                     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-                     0x01,0x00,0x00,0x00])
-        s.sendall(req)
-        s.settimeout(1.5)
-        resp = s.recv(64)
-        s.close()
-        if len(resp) >= 4 and resp[0] == 0x65:
-            session = struct.unpack_from('<I', resp, 4)[0] if len(resp) >= 8 else 0
-            return True, f"EtherNet/IP (CIP) – session=0x{session:08X} – Rockwell/Allen-Bradley"
-        return True, "port open – possible EtherNet/IP"
-    except:
+        with _tcp_connect(ip, port, timeout) as s:
+            req = bytes([0x65,0x00,0x04,0x00,0x00,0x00,0x00,0x00,
+                         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                         0x01,0x00,0x00,0x00])
+            s.sendall(req)
+            s.settimeout(1.5)
+            resp = s.recv(64)
+            if len(resp) >= 4 and resp[0] == 0x65:
+                session = struct.unpack_from('<I', resp, 4)[0] if len(resp) >= 8 else 0
+                return True, f"EtherNet/IP (CIP) – session=0x{session:08X} – Rockwell/Allen-Bradley"
+            return True, "port open – possible EtherNet/IP"
+    except Exception:
         return False, ""
 
 def probe_bacnet(ip, port=47808, timeout=2.0):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
         whoIs = bytes([0x81,0x0a,0x00,0x08,0x01,0x20,0xff,0xff])
-        s.sendto(whoIs, (ip, port))
-        resp, addr = s.recvfrom(256)
-        s.close()
+        sock.sendto(whoIs, (ip, port))
+        resp, addr = sock.recvfrom(256)
+        sock.close()
         if resp and resp[0] == 0x81:
             return True, f"BACnet/IP device – I-Am from {addr[0]} – building automation"
         return True, "BACnet port responded"
-    except:
+    except Exception:
         return False, ""
 
 def probe_profinet(ip, port=34980, timeout=2.0):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
         ident = bytes([0xfe,0xfe,0x05,0x00,0x00,0x00,0x00,0x00,
                        0x00,0x01,0x00,0x00,0x00,0x04,0xff,0xff])
-        s.sendto(ident, (ip, port))
+        sock.sendto(ident, (ip, port))
         try:
-            resp, addr = s.recvfrom(256)
-            s.close()
+            resp, _ = sock.recvfrom(256)
+            sock.close()
             if resp:
                 return True, "Profinet DCP – device identity response received"
-        except:
+        except socket.timeout:
             pass
-        s.close()
+        sock.close()
         return False, ""
-    except:
+    except Exception:
         return False, ""
 
 def probe_coap(ip, port=5683, timeout=2.0):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
         coap = bytes([0x40,0x01,0x00,0x01,0xbb,0x2e,0x77,0x65,
                       0x6c,0x6c,0x2d,0x6b,0x6e,0x6f,0x77,0x6e,
                       0x04,0x63,0x6f,0x72,0x65])
-        s.sendto(coap, (ip, port))
-        resp, addr = s.recvfrom(512)
-        s.close()
+        sock.sendto(coap, (ip, port))
+        resp, _ = sock.recvfrom(512)
+        sock.close()
         if resp:
             return True, "CoAP server – IoT device, no encryption"
         return False, ""
-    except:
+    except Exception:
         return False, ""
 
 def probe_mqtt(ip, port=1883, timeout=2.0):
     try:
-        s = _tcp_connect(ip, port, timeout)
-        cid = b'ot-auditor'
-        rem = 10 + len(cid)
-        conn = bytes([0x10, rem, 0x00, 4]) + b'MQTT' + bytes([0x04, 0x02, 0x00, 0x3c, 0x00, len(cid)]) + cid
-        s.sendall(conn)
-        s.settimeout(1.5)
-        r = s.recv(16)
-        s.close()
-        if len(r) >= 4 and r[0] == 0x20:
-            rc = r[3]
-            if rc == 0:
-                return True, "MQTT broker – anonymous CONNECT accepted (NO AUTH)"
-            else:
-                return True, f"MQTT broker – auth required (rc={rc})"
-        return True, "Port open – possible MQTT broker"
-    except:
+        with _tcp_connect(ip, port, timeout) as s:
+            cid = b'ot-auditor'
+            rem = 10 + len(cid)
+            conn = bytes([0x10, rem, 0x00, 4]) + b'MQTT' + bytes([0x04, 0x02, 0x00, 0x3c, 0x00, len(cid)]) + cid
+            s.sendall(conn)
+            s.settimeout(1.5)
+            r = s.recv(16)
+            if len(r) >= 4 and r[0] == 0x20:
+                rc = r[3]
+                if rc == 0:
+                    return True, "MQTT broker – anonymous CONNECT accepted (NO AUTH)"
+                else:
+                    return True, f"MQTT broker – auth required (rc={rc})"
+            return True, "Port open – possible MQTT broker"
+    except Exception:
         return False, ""
 
 def probe_fins(ip, port=9600, timeout=2.0):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
         fins = bytes([0x80,0x00,0x02,0x00,0x00,0x00,
                       0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
                       0x01,0x01,0x82,0x00,0x00,0x00,0x00,0x01])
-        s.sendto(fins, (ip, port))
-        resp, addr = s.recvfrom(256)
-        s.close()
+        sock.sendto(fins, (ip, port))
+        resp, _ = sock.recvfrom(256)
+        sock.close()
         if resp:
             return True, "Omron FINS – PLC responding – no authentication"
         return False, ""
-    except:
+    except Exception:
         return False, ""
 
 def probe_http(ip, port=80, https=False, timeout=3.0, cred_test=False):
+    """
+    Only return True if an actual HTTP/HTTPS response is received.
+    No false positive for just open port.
+    """
     scheme = "https" if https else "http"
     url = f"{scheme}://{ip}:{port}/"
+    # Use a custom context to avoid certificate validation issues
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, headers={"User-Agent": "OT-Scanner/1.0"})
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        req = urllib.request.Request(url, headers={"User-Agent": "OT-Scanner/1.0"})
         with urllib.request.urlopen(req, timeout=timeout, context=ctx if https else None) as r:
             body = r.read(2048).decode(errors='replace')
             title = ""
@@ -436,13 +457,12 @@ def probe_http(ip, port=80, https=False, timeout=3.0, cred_test=False):
             cred_result = None
             if cred_test:
                 cred_result = test_http_creds(ip, port, https, timeout)
-            return True, result, cred_result
-    except Exception as e:
-        try:
-            probe_tcp_open(ip, port, 1.0)
-            return True, f"{'HTTPS' if https else 'HTTP'} port open – no response ({type(e).__name__})", None
-        except:
-            return False, "", None
+                if cred_result:
+                    result += f" | ⚠ {cred_result}"
+            return True, result
+    except (urllib.error.URLError, socket.timeout, ConnectionError):
+        # No valid HTTP response: do NOT report as finding
+        return False, ""
 
 def test_http_creds(ip, port, https, timeout=3.0):
     scheme = "https" if https else "http"
@@ -461,8 +481,8 @@ def test_http_creds(ip, port, https, timeout=3.0):
                                          context=ctx if https else None) as r:
                 if r.status == 200:
                     return f"DEFAULT CREDS WORK: {cred['user']}/{cred['pass']} [{cred['vendor']}]"
-        except:
-            pass
+        except Exception:
+            continue
     return None
 
 def run_probe(proto_def, ip, timeout, cred_test):
@@ -483,13 +503,9 @@ def run_probe(proto_def, ip, timeout, cred_test):
         elif p == "mqtt":       return probe_mqtt(ip, port, timeout)
         elif p == "fins":       return probe_fins(ip, port, timeout)
         elif p == "http":
-            found, msg, cred = probe_http(ip, port, False, timeout, cred_test)
-            if cred: msg += f" | ⚠ {cred}"
-            return found, msg
+            return probe_http(ip, port, False, timeout, cred_test)
         elif p == "https":
-            found, msg, cred = probe_http(ip, port, True, timeout, cred_test)
-            if cred: msg += f" | ⚠ {cred}"
-            return found, msg
+            return probe_http(ip, port, True, timeout, cred_test)
         elif p == "tcp_banner":
             if transport == "tcp":
                 return probe_tcp_open(ip, port, timeout)
@@ -506,23 +522,27 @@ def run_probe(proto_def, ip, timeout, cred_test):
 def expand_targets(target_str):
     targets = []
     for part in target_str.replace(" ", "").split(","):
+        if not part:
+            continue
         try:
             if "/" in part:
                 net = ipaddress.ip_network(part, strict=False)
+                # Limit to a reasonable number of hosts
                 hosts = list(net.hosts())
                 if len(hosts) > 1024:
                     raise ValueError(f"Range {part} has {len(hosts)} hosts – max 1024")
-                targets.extend([str(h) for h in hosts])
+                targets.extend(str(h) for h in hosts)
             elif "-" in part and part.count(".") == 3:
                 base, end = part.rsplit(".", 1)
                 start_oct, end_oct = end.split("-") if "-" in end else (end, end)
                 for i in range(int(start_oct), int(end_oct) + 1):
                     targets.append(f"{base}.{i}")
             else:
-                ipaddress.ip_address(part)
+                ipaddress.ip_address(part)  # validate
                 targets.append(part)
         except ValueError as e:
             raise ValueError(f"Invalid target '{part}': {e}")
+    # Deduplicate while preserving order
     return list(dict.fromkeys(targets))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -565,6 +585,14 @@ class OTAuditorApp:
         self.root.minsize(1200, 800)
         self.root.configure(bg=C["bg"])
 
+        # Check requirements and show warning if PDF not available
+        ok, missing = check_requirements()
+        if not PDF_AVAILABLE:
+            messagebox.showwarning("Missing Optional Module",
+                                   "PDF export requires 'reportlab'.\n"
+                                   "Install with: pip install reportlab\n"
+                                   "Other export formats (CSV, JSON, XML) are still available.")
+
         self.scan_thread = None
         self.stop_event = threading.Event()
         self.log_queue = queue.Queue()
@@ -606,7 +634,7 @@ class OTAuditorApp:
 
     def _build_main_pane(self):
         main = tk.Frame(self.root, bg=C["bg"])
-        main.pack(fill="both", expand=True, padx=0, pady=0)
+        main.pack(fill="both", expand=True)
 
         # LEFT PANEL – controls (wider)
         left = tk.Frame(main, bg=C["bg2"], width=360)
@@ -838,7 +866,6 @@ class OTAuditorApp:
             selectbackground=C["amber_dim"])
         self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
         self.log_text.config(state="disabled")
-        # tags same as before
         self.log_text.tag_configure("head",  foreground=C["amber"],   font=FONT_MONO_B)
         self.log_text.tag_configure("found", foreground=C["cyan"],    font=FONT_MONO_B)
         self.log_text.tag_configure("warn",  foreground=C["orange"])
@@ -922,7 +949,7 @@ class OTAuditorApp:
                                    bg="#090b0e", fg=C["amber"], font=FONT_SMALL)
         self.lbl_found.pack(side="right", padx=12)
 
-    # ── SCAN ENGINE (unchanged from working version) ─────────────────────────
+    # ── SCAN ENGINE ─────────────────────────────────────────────────────────
 
     def _start_scan(self):
         target_str = self.entry_target.get().strip()
@@ -931,15 +958,22 @@ class OTAuditorApp:
             return
         try:
             targets = expand_targets(target_str)
+            if not targets:
+                messagebox.showwarning("No Targets", "No valid IP addresses found.")
+                return
         except ValueError as e:
             messagebox.showerror("Invalid Target", str(e))
             return
 
         try:
             timeout = int(self.entry_timeout.get()) / 1000.0
+            if timeout <= 0:
+                raise ValueError
             threads = int(self.entry_threads.get())
+            if threads < 1 or threads > 200:
+                raise ValueError
         except ValueError:
-            messagebox.showerror("Config Error", "Timeout and Threads must be integers.")
+            messagebox.showerror("Config Error", "Timeout (>0 ms) and Threads (1-200) must be valid integers.")
             return
 
         selected_protos = [p for (var, p) in self.proto_vars.values() if var.get()]
@@ -1086,7 +1120,7 @@ class OTAuditorApp:
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
-    # ── RISK SUMMARY (same as before) ─────────────────────────────────────────
+    # ── RISK SUMMARY ─────────────────────────────────────────────────────────
 
     def _build_risk_summary(self):
         rt = self.risk_text
