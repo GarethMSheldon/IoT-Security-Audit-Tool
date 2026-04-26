@@ -1,4 +1,4 @@
-```markdown
+
 # OT/ICS Security Auditor – Python GUI Edition
 
 A comprehensive Python-based security assessment toolkit for OT (Operational Technology), ICS (Industrial Control Systems), SCADA, and IoT devices. Performs deep discovery of industrial protocols, checks for default credentials, insecure configurations, and missing encryption – all through a modern dark‑amber graphical interface.
@@ -251,4 +251,3 @@ Special thanks to the tkinter community and industrial control system security r
 **Last Updated**: April 26, 2026  
 **Current Version**: v1.2  
 **Maintained By**: Gareth Sheldon
-```
